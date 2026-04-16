@@ -1,13 +1,23 @@
 # Dataset loading and spike encoding for Google Speech Commands
 # Audio pipeline: waveform -> mel spectrogram -> rate-encoded spike trains
+#
+# Uses soundfile for WAV loading to avoid torchaudio's torchcodec/FFmpeg dependency.
+# torchaudio.transforms (MelSpectrogram, AmplitudeToDB) are pure PyTorch -- no FFmpeg needed.
 
 import os
+import urllib.request
+import tarfile
+from pathlib import Path
+
+import numpy as np
+import librosa
+import soundfile as sf
 import torch
-import torchaudio
-from torchaudio.datasets import SPEECHCOMMANDS
 from torch.utils.data import DataLoader
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), '..', 'data')
+DATASET_URL = 'http://download.tensorflow.org/data/speech_commands_v0.02.tar.gz'
+DATASET_FOLDER = 'SpeechCommands'
 
 # All 35 core words in Speech Commands v2
 CLASSES = sorted([
@@ -25,17 +35,71 @@ N_FFT = 512
 HOP_LENGTH = 160  # 10ms hop -> T=101 frames for 1s audio
 
 
+def _download(data_dir):
+    """Download and extract Speech Commands v0.02 if not already present."""
+    extract_dir = Path(data_dir) / DATASET_FOLDER
+    # The tar contains a top-level speech_commands_v0.02/ folder
+    dataset_dir = extract_dir / 'speech_commands_v0.02'
+
+    if dataset_dir.exists():
+        return dataset_dir
+
+    tar_path = Path(data_dir) / 'speech_commands_v0.02.tar.gz'
+    os.makedirs(data_dir, exist_ok=True)
+
+    if not tar_path.exists():
+        print("Downloading Speech Commands v0.02 (~2.4GB)...")
+        urllib.request.urlretrieve(DATASET_URL, tar_path)
+        print("Download complete.")
+
+    print("Extracting...")
+    extract_dir.mkdir(parents=True, exist_ok=True)
+    with tarfile.open(tar_path) as tf:
+        tf.extractall(extract_dir)
+    print("Extraction complete.")
+
+    return dataset_dir
+
+
+def _get_samples(dataset_dir, subset):
+    """
+    Returns list of (wav_path, label) for the given subset.
+    Splits are defined by validation_list.txt and testing_list.txt in the dataset root.
+    Training = everything not in those two lists.
+    """
+    dataset_dir = Path(dataset_dir)
+    val_set  = set((dataset_dir / 'validation_list.txt').read_text().splitlines())
+    test_set = set((dataset_dir / 'testing_list.txt').read_text().splitlines())
+
+    samples = []
+    for label in CLASSES:
+        label_dir = dataset_dir / label
+        if not label_dir.exists():
+            continue
+        for wav_file in sorted(label_dir.glob('*.wav')):
+            rel = f"{label}/{wav_file.name}"
+            if subset == 'validation':
+                if rel in val_set:
+                    samples.append((str(wav_file), label))
+            elif subset == 'testing':
+                if rel in test_set:
+                    samples.append((str(wav_file), label))
+            else:  # training
+                if rel not in val_set and rel not in test_set:
+                    samples.append((str(wav_file), label))
+
+    return samples
+
+
 def rate_encode(mel_spec, n_steps):
     """
     Convert a normalized mel spectrogram to a spike train via rate coding.
 
     mel_spec: (1, N_MELS, T) float tensor in [0, 1]
-              each value is the spike probability for that bin at that frame
-    n_steps:  number of independent spike samples to draw
+    n_steps:  number of independent Bernoulli samples to draw
 
     Returns: (n_steps, 1, N_MELS, T) binary tensor
     """
-    # Expand along new time dimension and sample Bernoulli independently
     mel_expanded = mel_spec.unsqueeze(0).expand(n_steps, -1, -1, -1)
     return torch.bernoulli(mel_expanded)
 
@@ -47,44 +111,40 @@ class SpeechCommandsDataset(torch.utils.data.Dataset):
         n_time_steps: number of rate-coded spike frames to generate per sample
         """
         self.n_time_steps = n_time_steps
-        self.mel_transform = torchaudio.transforms.MelSpectrogram(
-            sample_rate=SAMPLE_RATE,
-            n_fft=N_FFT,
-            hop_length=HOP_LENGTH,
-            n_mels=N_MELS,
-        )
-        self.amplitude_to_db = torchaudio.transforms.AmplitudeToDB()
-
-        raw = SPEECHCOMMANDS(root=data_dir, subset=subset, download=True)
-        # Filter to only the 35 core word classes
-        self.samples = [s for s in raw if s[2] in CLASS_TO_IDX]
+        dataset_dir = _download(data_dir)
+        self.samples = _get_samples(dataset_dir, subset)
+        print(f"[{subset}] {len(self.samples)} samples loaded.")
 
     def __len__(self):
         return len(self.samples)
 
     def __getitem__(self, idx):
-        waveform, sample_rate, label, *_ = self.samples[idx]
+        wav_path, label = self.samples[idx]
 
-        if sample_rate != SAMPLE_RATE:
-            waveform = torchaudio.functional.resample(waveform, sample_rate, SAMPLE_RATE)
+        # soundfile reads (samples,) as numpy; Speech Commands is mono
+        audio, sample_rate = sf.read(wav_path, dtype='float32')
 
         # Pad or trim to exactly 1 second
-        n = waveform.shape[1]
-        if n < SAMPLE_RATE:
-            waveform = torch.nn.functional.pad(waveform, (0, SAMPLE_RATE - n))
+        if len(audio) < SAMPLE_RATE:
+            audio = np.pad(audio, (0, SAMPLE_RATE - len(audio)))
         else:
-            waveform = waveform[:, :SAMPLE_RATE]
+            audio = audio[:SAMPLE_RATE]
 
-        # Mel spectrogram: (1, N_MELS, T=101)
-        mel = self.mel_transform(waveform)       # power spectrogram
-        mel = self.amplitude_to_db(mel)          # log scale, more spike-friendly
+        # Mel spectrogram via librosa: (N_MELS, T=101)
+        mel = librosa.feature.melspectrogram(
+            y=audio, sr=SAMPLE_RATE, n_fft=N_FFT,
+            hop_length=HOP_LENGTH, n_mels=N_MELS
+        )
+        mel = librosa.power_to_db(mel)  # log scale
 
         # Normalize to [0, 1] for Bernoulli sampling
         mel_min, mel_max = mel.min(), mel.max()
         if mel_max > mel_min:
             mel = (mel - mel_min) / (mel_max - mel_min)
         else:
-            mel = torch.zeros_like(mel)
+            mel = np.zeros_like(mel)
+
+        mel = torch.from_numpy(mel).unsqueeze(0)  # (1, N_MELS, T)
 
         # Rate encode: (n_time_steps, 1, N_MELS, T)
         spikes = rate_encode(mel, self.n_time_steps)
@@ -98,7 +158,7 @@ def collate_fn(batch):
     to match the SNN forward loop convention used in the gesture project.
     """
     spikes, labels = zip(*batch)
-    spikes = torch.stack(spikes)           # (batch, n_time_steps, 1, N_MELS, T)
+    spikes = torch.stack(spikes)            # (batch, n_time_steps, 1, N_MELS, T)
     spikes = spikes.permute(1, 0, 2, 3, 4) # (n_time_steps, batch, 1, N_MELS, T)
     labels = torch.tensor(labels, dtype=torch.long)
     return spikes, labels

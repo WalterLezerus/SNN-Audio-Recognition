@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 from torch.optim import Adam
 from torch.optim.lr_scheduler import StepLR
+import torch_directml
 
 from dataset import get_dataloaders, NUM_CLASSES
 from model import SNNAudioNet
@@ -21,7 +22,7 @@ N_TIME_STEPS = 50  # rate-coded spike frames per sample
 
 
 def train(epochs=EPOCHS, batch_size=BATCH_SIZE, lr=LR, n_time_steps=N_TIME_STEPS):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch_directml.device()
 
     train_loader, val_loader = get_dataloaders(
         batch_size=batch_size, n_time_steps=n_time_steps

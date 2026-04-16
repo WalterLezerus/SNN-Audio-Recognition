@@ -1,5 +1,7 @@
 torch
-torchaudio
+torch-directml
 snntorch
+soundfile
+librosa
 numpy
 matplotlib
