@@ -1,0 +1,17 @@
+# Data and model weights
+data/
+models/*.pth
+models/*.log
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.env
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db

@@ -1,0 +1,5 @@
+torch
+torchaudio
+snntorch
+numpy
+matplotlib
