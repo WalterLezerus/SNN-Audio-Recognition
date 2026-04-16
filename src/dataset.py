@@ -19,15 +19,15 @@ DATA_DIR = os.path.join(os.path.dirname(__file__), '..', 'data')
 DATASET_URL = 'http://download.tensorflow.org/data/speech_commands_v0.02.tar.gz'
 DATASET_FOLDER = 'SpeechCommands'
 
-# All 35 core words in Speech Commands v2
+# 35 core words + silence class
 CLASSES = sorted([
     'backward', 'bed', 'bird', 'cat', 'dog', 'down', 'eight', 'five',
     'follow', 'forward', 'four', 'go', 'happy', 'house', 'learn', 'left',
     'marvin', 'nine', 'no', 'off', 'on', 'one', 'right', 'seven', 'sheila',
     'six', 'stop', 'three', 'tree', 'two', 'up', 'visual', 'wow', 'yes', 'zero'
-])
+]) + ['silence']
 CLASS_TO_IDX = {c: i for i, c in enumerate(CLASSES)}
-NUM_CLASSES = len(CLASSES)
+NUM_CLASSES = len(CLASSES)  # 36
 
 SAMPLE_RATE = 16000
 N_MELS = 40
@@ -61,18 +61,55 @@ def _download(data_dir):
     return dataset_dir
 
 
+def _get_silence_samples(dataset_dir, n_samples):
+    """
+    Slice ambient audio from _background_noise_/ into 1-second clips.
+    Returns list of (audio_array, 'silence') tuples -- stored in memory, not as files.
+    Generates n_samples clips spread across all available noise files.
+    """
+    noise_dir = Path(dataset_dir) / '_background_noise_'
+    if not noise_dir.exists():
+        return []
+
+    noise_files = list(noise_dir.glob('*.wav'))
+    if not noise_files:
+        return []
+
+    clips = []
+    per_file = max(1, n_samples // len(noise_files))
+
+    for wav_file in noise_files:
+        audio, sr = sf.read(str(wav_file), dtype='float32')
+        if audio.ndim > 1:
+            audio = audio[:, 0]  # take first channel if stereo
+        if sr != SAMPLE_RATE:
+            audio = librosa.resample(audio, orig_sr=sr, target_sr=SAMPLE_RATE)
+
+        # Slide a 1-second window with random offsets
+        max_start = len(audio) - SAMPLE_RATE
+        if max_start <= 0:
+            continue
+        starts = np.random.randint(0, max_start, size=per_file)
+        for start in starts:
+            clips.append((audio[start:start + SAMPLE_RATE].copy(), 'silence'))
+
+    return clips[:n_samples]
+
+
 def _get_samples(dataset_dir, subset):
     """
-    Returns list of (wav_path, label) for the given subset.
+    Returns list of (wav_path_or_array, label) for the given subset.
     Splits are defined by validation_list.txt and testing_list.txt in the dataset root.
     Training = everything not in those two lists.
+    Silence samples are generated from _background_noise_/ to match ~avg word count.
     """
     dataset_dir = Path(dataset_dir)
     val_set  = set((dataset_dir / 'validation_list.txt').read_text().splitlines())
     test_set = set((dataset_dir / 'testing_list.txt').read_text().splitlines())
 
+    word_classes = [c for c in CLASSES if c != 'silence']
     samples = []
-    for label in CLASSES:
+    for label in word_classes:
         label_dir = dataset_dir / label
         if not label_dir.exists():
             continue
@@ -87,6 +124,18 @@ def _get_samples(dataset_dir, subset):
             else:  # training
                 if rel not in val_set and rel not in test_set:
                     samples.append((str(wav_file), label))
+
+    # Add silence samples -- roughly match average per-word count
+    avg_per_word = len(samples) // max(len(word_classes), 1)
+    if subset == 'validation':
+        n_silence = avg_per_word // 5   # lighter for val
+    elif subset == 'testing':
+        n_silence = avg_per_word // 5
+    else:
+        n_silence = avg_per_word
+
+    silence_clips = _get_silence_samples(dataset_dir, n_silence)
+    samples.extend(silence_clips)
 
     return samples
 
@@ -119,10 +168,14 @@ class SpeechCommandsDataset(torch.utils.data.Dataset):
         return len(self.samples)
 
     def __getitem__(self, idx):
-        wav_path, label = self.samples[idx]
+        source, label = self.samples[idx]
 
-        # soundfile reads (samples,) as numpy; Speech Commands is mono
-        audio, sample_rate = sf.read(wav_path, dtype='float32')
+        if isinstance(source, str):
+            # Word sample -- load from file
+            audio, _ = sf.read(source, dtype='float32')
+        else:
+            # Silence sample -- already a numpy array
+            audio = source
 
         # Pad or trim to exactly 1 second
         if len(audio) < SAMPLE_RATE:

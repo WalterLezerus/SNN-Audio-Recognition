@@ -25,7 +25,7 @@ class SNNAudioNet(nn.Module):
     global average pool, one spiking FC, non-spiking readout accumulated over time.
     """
 
-    def __init__(self, num_classes=35, beta=0.9):
+    def __init__(self, num_classes=36, beta=0.9):
         super().__init__()
         spike_grad = surrogate.fast_sigmoid(slope=SLOPE)
 
